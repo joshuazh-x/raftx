@@ -1,0 +1,19 @@
+syntax = "proto2";
+package raftpb;
+
+import "gogoproto/gogo.proto";
+
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.sizer_all) = true;
+option (gogoproto.unmarshaler_all) = true;
+option (gogoproto.goproto_getters_all) = false;
+option (gogoproto.goproto_enum_prefix_all) = false;
+option (gogoproto.goproto_unkeyed_all) = false;
+option (gogoproto.goproto_unrecognized_all) = false;
+option (gogoproto.goproto_sizecache_all) = false;
+
+message SubtermInfo {
+	optional uint64 subterm = 1 [(gogoproto.nullable) = false];
+	repeated uint64 replication_set = 2;
+	repeated uint64 replication_set_outgoing   = 3;
+}
