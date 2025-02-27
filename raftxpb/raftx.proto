@@ -1,5 +1,5 @@
 syntax = "proto2";
-package raftpb;
+package raftxpb;
 
 import "gogoproto/gogo.proto";
 
@@ -12,8 +12,10 @@ option (gogoproto.goproto_unkeyed_all) = false;
 option (gogoproto.goproto_unrecognized_all) = false;
 option (gogoproto.goproto_sizecache_all) = false;
 
-message SubtermInfo {
-	optional uint64 subterm = 1 [(gogoproto.nullable) = false];
-	repeated uint64 replication_set = 2;
-	repeated uint64 replication_set_outgoing   = 3;
+message WitnessContext {
+	optional bytes context = 1;
+	optional uint64 subterm = 2 [(gogoproto.nullable) = false];
+	repeated uint64 replication_set = 3;
+	repeated uint64 replication_set_outgoing = 4;
+	repeated uint64 votes = 5;
 }

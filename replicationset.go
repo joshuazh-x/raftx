@@ -1,6 +1,7 @@
 package raftx
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -33,10 +34,20 @@ func (r ReplicationSet) String() string {
 	for i, v := range arr {
 		strArr[i] = strconv.FormatUint(v, 16)
 	}
-	return strings.Join(strArr, ",")
+	return fmt.Sprintf("(%s)", strings.Join(strArr, ","))
 }
 
 func (r ReplicationSet) Contains(id uint64) bool {
 	_, ok := r[id]
 	return ok
+}
+
+type JointReplicationSet [2]ReplicationSet
+
+func (r JointReplicationSet) Equals(rs JointReplicationSet) bool {
+	return r[0].Equals(rs[0]) && r[1].Equals(rs[1])
+}
+
+func (r JointReplicationSet) String() string {
+	return fmt.Sprintf("[%s, %s]", r[0].String(), r[1].String())
 }

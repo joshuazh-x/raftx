@@ -12,12 +12,11 @@ import (
 type ReplicationSetVoterPriority int
 
 const (
-	StaleOutsideVoter ReplicationSetVoterPriority = 1
-	StaleWitness      ReplicationSetVoterPriority = 2
-	StaleNonWitness   ReplicationSetVoterPriority = 3
-	HealthyWitness    ReplicationSetVoterPriority = 4
-	Nothing           ReplicationSetVoterPriority = 5
-	HealthyNonWitness ReplicationSetVoterPriority = 6
+	StaleWitness      ReplicationSetVoterPriority = 1
+	StaleNonWitness   ReplicationSetVoterPriority = 2
+	HealthyWitness    ReplicationSetVoterPriority = 3
+	Nothing           ReplicationSetVoterPriority = 4
+	HealthyNonWitness ReplicationSetVoterPriority = 5
 )
 
 type peer struct {
@@ -29,17 +28,20 @@ type peerTracker struct {
 	ticks          uint64
 	peers          map[uint64]*peer
 	voters         quorum.JointConfig
+	replicationSet JointReplicationSet
 	staleThreshold uint64
 }
 
 func newPeerTracker(cs *raftpb.ConfState, staleThreshold uint64) *peerTracker {
 	t := &peerTracker{
+		ticks:          0,
 		peers:          map[uint64]*peer{},
 		voters:         quorum.JointConfig{},
 		staleThreshold: staleThreshold,
 	}
 
 	t.applyConfChange(cs)
+	t.adjustReplicationSet()
 
 	return t
 }
@@ -75,14 +77,6 @@ func (t *peerTracker) observe(id uint64) {
 	}
 }
 
-func (t *peerTracker) isStale(id uint64) bool {
-	if p, ok := t.peers[id]; ok {
-		return t.ticks-p.lastSeenAt > t.staleThreshold
-	}
-
-	return true
-}
-
 func (t *peerTracker) setWitness(id uint64) bool {
 	if p, ok := t.peers[id]; ok {
 		p.isWitness = true
@@ -93,24 +87,42 @@ func (t *peerTracker) setWitness(id uint64) bool {
 }
 
 func (t *peerTracker) isWitness(id uint64) bool {
-	return t.peers[id].isWitness
+	p, ok := t.peers[id]
+	return ok && p.isWitness
 }
 
-func (t *peerTracker) getReplicationSetVoterPriority(id uint64, r ReplicationSet) ReplicationSetVoterPriority {
+func (t *peerTracker) isVoter(id uint64) bool {
+	if _, ok := t.voters[0][id]; ok {
+		return true
+	}
+	if _, ok := t.voters[1][id]; ok {
+		return true
+	}
+
+	return false
+}
+
+func (t *peerTracker) isReplicationSetCandidate(id uint64) bool {
+	for i, voters := range t.voters {
+		if _, ok := voters[id]; ok && !t.replicationSet[i].Contains(id) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (t *peerTracker) getReplicationSetVoterPriority(id uint64) ReplicationSetVoterPriority {
 	p, ok := t.peers[id]
 	if !ok {
 		return Nothing
 	}
 
 	if t.ticks-p.lastSeenAt > t.staleThreshold {
-		if _, inside := r[id]; inside {
-			if p.isWitness {
-				return StaleWitness
-			}
-			return StaleNonWitness
-		} else {
-			return StaleOutsideVoter
+		if p.isWitness {
+			return StaleWitness
 		}
+		return StaleNonWitness
 	} else {
 		if p.isWitness {
 			return HealthyWitness
@@ -119,42 +131,31 @@ func (t *peerTracker) getReplicationSetVoterPriority(id uint64, r ReplicationSet
 	}
 }
 
-func (t *peerTracker) getReplicationSet(current ReplicationSet, incoming bool) ReplicationSet {
-	voters := t.voters[0]
-	if !incoming {
-		voters = t.voters[1]
-	}
-
-	var excluded uint64 = 0
-	excludedPriority := Nothing
-	set := ReplicationSet{}
-	for id := range voters {
-		priority := t.getReplicationSetVoterPriority(id, current)
-		if priority == Nothing {
-			continue
-		}
-		if priority >= excludedPriority {
-			set[id] = struct{}{}
-		} else {
-			if excludedPriority != Nothing {
-				set[excluded] = struct{}{}
+func (t *peerTracker) adjustReplicationSet() bool {
+	newReplicationSet := JointReplicationSet{}
+	for i, voters := range t.voters {
+		var excluded uint64 = 0
+		excludedPriority := Nothing
+		newReplicationSet[i] = ReplicationSet{}
+		for id := range voters {
+			priority := t.getReplicationSetVoterPriority(id)
+			if priority == Nothing {
+				continue
 			}
-			excluded = id
-			excludedPriority = priority
-		}
-	}
-	return set
-}
-
-func (t *peerTracker) getDefaultReplicationSets() [2]ReplicationSet {
-	sets := [2]ReplicationSet{}
-	for i, c := range t.voters {
-		for id := range c {
-			sets[i][id] = struct{}{}
+			_, wasIncluded := t.replicationSet[i][id]
+			if priority > excludedPriority {
+				newReplicationSet[i][id] = struct{}{}
+			} else if priority < excludedPriority || (priority == excludedPriority && !wasIncluded) {
+				if excludedPriority != Nothing {
+					newReplicationSet[i][excluded] = struct{}{}
+				}
+				excluded = id
+				excludedPriority = priority
+			}
 		}
 	}
 
-	return sets
+	return !t.replicationSet[0].Equals(newReplicationSet[0]) || !t.replicationSet[1].Equals(newReplicationSet[1])
 }
 
 type replicationSetMatchAckIndexer struct {
@@ -194,16 +195,48 @@ func (ai replicationSetMatchAckIndexer) AckedIndex(id uint64) (quorum.Index, boo
 	return quorum.Index(pr.Match), true
 }
 
-func (t *peerTracker) committedOnWitnessAck(rs [2]ReplicationSet, rn *raft.RawNode) uint64 {
+func (t *peerTracker) committedPendingWitnessAck(rn *raft.RawNode) (uint64, []uint64) {
 	pm := tracker.ProgressMap{}
+	witnessMatch := map[uint64]uint64{}
 	rn.WithProgress(func(id uint64, typ raft.ProgressType, pr tracker.Progress) {
 		pm[id] = &pr
+		if t.isWitness(id) {
+			witnessMatch[id] = pr.Match
+		}
 	})
 
-	idx0 := t.voters[0].CommittedIndex(newReplicationSetMatchAckIndexer(rs[0], t.peers, pm))
-	idx1 := t.voters[1].CommittedIndex(newReplicationSetMatchAckIndexer(rs[1], t.peers, pm))
-	if idx0 < idx1 {
-		return uint64(idx0)
+	idx0 := t.voters[0].CommittedIndex(newReplicationSetMatchAckIndexer(t.replicationSet[0], t.peers, pm))
+	idx1 := t.voters[1].CommittedIndex(newReplicationSetMatchAckIndexer(t.replicationSet[1], t.peers, pm))
+
+	idx := uint64(idx0)
+	if idx0 > idx1 {
+		idx = uint64(idx1)
 	}
-	return uint64(idx1)
+
+	witness := []uint64{}
+	for id, match := range witnessMatch {
+		if match < idx {
+			witness = append(witness, id)
+		}
+	}
+
+	return idx, witness
+}
+
+func (t *peerTracker) voteResultWithExtraVote(votes map[uint64]bool, id uint64) quorum.VoteResult {
+	for _, voters := range t.voters {
+		revert := func() {}
+		defer func() { revert() }()
+		if _, voted := votes[id]; !voted {
+			votes[id] = true
+			revert = func() { delete(votes, id) }
+			break
+		}
+		r := voters.VoteResult(votes)
+		if r != quorum.VotePending {
+			return r
+		}
+	}
+
+	return quorum.VotePending
 }
