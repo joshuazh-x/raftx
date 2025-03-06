@@ -91,15 +91,13 @@ func (t *peerTracker) isWitness(id uint64) bool {
 	return ok && p.isWitness
 }
 
-func (t *peerTracker) isVoter(id uint64) bool {
-	if _, ok := t.voters[0][id]; ok {
-		return true
+func (t *peerTracker) isVoter(id uint64, incoming bool) bool {
+	i := 0
+	if !incoming {
+		i = 1
 	}
-	if _, ok := t.voters[1][id]; ok {
-		return true
-	}
-
-	return false
+	_, ok := t.voters[i][id]
+	return ok
 }
 
 func (t *peerTracker) isReplicationSetCandidate(id uint64) bool {
@@ -223,20 +221,20 @@ func (t *peerTracker) committedPendingWitnessAck(rn *raft.RawNode) (uint64, []ui
 	return idx, witness
 }
 
-func (t *peerTracker) voteResultWithExtraVote(votes map[uint64]bool, id uint64) quorum.VoteResult {
-	for _, voters := range t.voters {
-		revert := func() {}
-		defer func() { revert() }()
+func (t *peerTracker) hasSubQuorumVotes(votes map[uint64]bool, incoming bool) bool {
+	i := 0
+	if !incoming {
+		i = 1
+	}
+	voters := t.voters[i]
+	extra := uint64(0)
+	defer delete(votes, extra)
+	for id := range voters {
 		if _, voted := votes[id]; !voted {
-			votes[id] = true
-			revert = func() { delete(votes, id) }
+			extra = id
+			votes[extra] = true
 			break
 		}
-		r := voters.VoteResult(votes)
-		if r != quorum.VotePending {
-			return r
-		}
 	}
-
-	return quorum.VotePending
+	return voters.VoteResult(votes) == quorum.VoteWon
 }

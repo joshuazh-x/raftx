@@ -20,12 +20,14 @@ fi
 
 GOFAST_BIN=$(tool_get_bin github.com/gogo/protobuf/protoc-gen-gofast)
 GOGOPROTO_ROOT="$(tool_pkg_dir github.com/gogo/protobuf/proto)/.."
+RAFT_ROOT=$(tool_pkg_dir go.etcd.io/raft/v3)
 
 echo
 echo "Resolved binary and packages versions:"
 echo "  - protoc-gen-gofast:       ${GOFAST_BIN}"
 echo "  - gogoproto-root:          ${GOGOPROTO_ROOT}"
 GOGOPROTO_PATH="${GOGOPROTO_ROOT}:${GOGOPROTO_ROOT}/protobuf"
+RAFTPROTO_PATH="${RAFT_ROOT}/raftpb"
 
 # directories containing protos to be built
 DIRS="./raftxpb"
@@ -34,7 +36,7 @@ log_callout -e "\\nRunning gofast (gogo) proto generation..."
 
 for dir in ${DIRS}; do
   pushd "${dir}"
-    protoc --gofast_out=. -I=".:${GOGOPROTO_PATH}:${RAFT_ROOT_DIR}/..:${RAFT_ROOT_DIR}" \
+    protoc --gofast_out=. -I=".:${GOGOPROTO_PATH}:${RAFT_ROOT_DIR}/..:${RAFTPROTO_PATH}:" \
       --plugin="${GOFAST_BIN}" ./**/*.proto
 
     sed -i.bak -E 's|"raftx/raftxpb"|"github.com/joshuazh-x/raftx/v3/raftxpb"|g' ./**/*.pb.go

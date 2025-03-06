@@ -22,31 +22,6 @@ func (c *AfterRaftTickCommand) Do(rn *raft.RawNode) {
 	}
 }
 
-type BeforeRaftStepCommand struct {
-	rx *raftx
-	m  *raftpb.Message
-}
-
-func NewBeforeRaftStepCommand(rx *raftx, m *raftpb.Message) *BeforeRaftStepCommand {
-	return &BeforeRaftStepCommand{
-		rx: rx,
-		m:  m,
-	}
-}
-
-func (c *BeforeRaftStepCommand) Do(rn *raft.RawNode) {
-	st := rn.BasicStatus()
-	if st.RaftState != raft.StateLeader {
-		if c.m.Type == raftpb.MsgApp {
-			for _, e := range c.m.Entries {
-				if e.Type == EntryTypeSubterm {
-					c.rx.slicer.AddSubterm(e.Term, decodeUint64(e.Data), e.Index)
-				}
-			}
-		}
-	}
-}
-
 type AfterRaftStepCommand struct {
 	rx *raftx
 	m  *raftpb.Message
@@ -72,7 +47,9 @@ func (c *AfterRaftStepCommand) Do(rn *raft.RawNode) {
 			c.rx.maybeStartNewSubterm(rn)
 		}
 	case raft.StatePreCandidate, raft.StateCandidate:
-
+		if c.m.Type == raftpb.MsgVoteResp || c.m.Type == raftpb.MsgPreVoteResp {
+			c.rx.maybeSendPendingVotes(rn)
+		}
 	}
 }
 
@@ -89,7 +66,7 @@ func NewAfterRaftApplyConfChangeCommand(rx *raftx, cs *raftpb.ConfState) *AfterR
 }
 
 func (c *AfterRaftApplyConfChangeCommand) Do(rn *raft.RawNode) {
-	c.rx.applyConfChange(rn, c.cs)
+	c.rx.applyConfChange(c.cs, rn)
 }
 
 type ReadyCommand struct {
@@ -107,10 +84,18 @@ func NewReadyCommand(rx *raftx, ready *raft.Ready, readyc chan<- raft.Ready) *Re
 }
 
 func (c *ReadyCommand) Do(rn *raft.RawNode) {
+	for _, e := range c.ready.Entries {
+		if len(e.Data) == 0 && c.rx.slicer.GetSubterm(e.Index).Term != e.Term {
+			// this is the first entry in each term
+			c.rx.slicer.AppendSubterm(e.Term, 0, e.Index)
+		} else if e.Type == EntryTypeSubterm {
+			c.rx.slicer.AppendSubterm(e.Term, decodeUint64(e.Data), e.Index)
+		}
+	}
 	if c.ready.RaftState == raft.StateLeader && c.rx.state != raft.StateLeader {
 		c.rx.becomeLeader(c.ready.Term)
 	}
-	c.ready.Messages = c.rx.patchMessages(c.ready.Messages)
+	c.ready.Messages = c.rx.patchReadyMessages(c.ready.Messages, rn)
 	c.readyc <- *c.ready
 }
 

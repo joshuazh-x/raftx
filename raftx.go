@@ -3,7 +3,6 @@ package raftx
 import (
 	"github.com/joshuazh-x/raftx/v3/raftxpb"
 	"go.etcd.io/raft/v3"
-	"go.etcd.io/raft/v3/quorum"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
@@ -12,17 +11,36 @@ const (
 	WitnessRejection = "witness-rejection"
 )
 
+type outboundMessagesInSameTerm map[uint64]raftpb.Message
+
+func (ms outboundMessagesInSameTerm) addAndPurgeOld(m raftpb.Message) outboundMessagesInSameTerm {
+	result := ms
+	if ms.term() != m.Term {
+		result = map[uint64]raftpb.Message{}
+	}
+	result[m.To] = m
+	return result
+}
+
+func (ms outboundMessagesInSameTerm) term() uint64 {
+	for _, m := range ms {
+		return m.Term
+	}
+	return 0
+}
+
 type raftx struct {
-	id          uint64
-	term        uint64
-	subterm     uint64
-	state       raft.StateType
-	cs          *raftpb.ConfState
-	tracker     *peerTracker
-	cfg         Config
-	witnessMsgs []raftpb.Message
-	logger      raft.Logger
-	slicer      SubtermSlicer
+	id           uint64
+	term         uint64
+	subterm      uint64
+	state        raft.StateType
+	cs           *raftpb.ConfState
+	tracker      *peerTracker
+	cfg          Config
+	pendingVotes outboundMessagesInSameTerm
+	msgs         []raftpb.Message
+	logger       raft.Logger
+	slicer       SubtermSlicer
 }
 
 func (r *raftx) maybeStartNewSubterm(rn *raft.RawNode) bool {
@@ -47,10 +65,6 @@ func (r *raftx) maybeStartNewSubterm(rn *raft.RawNode) bool {
 		r.logger.Panic("subterm entry was dropped")
 	}
 
-	// get subterm entry location
-
-	r.slicer.AddSubterm(r.term, r.subterm, rn.BasicStatus().LastLogIndex)
-
 	r.logger.Infof("%x starts new subterm. Term: %d, Subterm: %d, Replication Set: %s", r.id, r.term, r.subterm, r.tracker.replicationSet)
 	return true
 }
@@ -73,13 +87,15 @@ func (r *raftx) tick() {
 }
 
 func (r *raftx) maybeSendAppendToWitness(rn *raft.RawNode) {
+	term := rn.BasicStatus().Term
 	commitIndex, witness := r.tracker.committedPendingWitnessAck(rn)
-	commitSubterm := r.slicer.GetSubterm(r.term, commitIndex)
-	if commitSubterm == r.subterm {
+	commitSubterm := r.slicer.GetSubterm(commitIndex)
+	if commitSubterm.Term == r.term && commitSubterm.Subterm == r.subterm {
 		for _, id := range witness {
 			witnessContext := raftxpb.WitnessContext{
 				Context:                nil,
-				Subterm:                r.subterm,
+				LogTerm:                commitSubterm.Term,
+				LogSubterm:             commitSubterm.Subterm,
 				ReplicationSet:         r.tracker.replicationSet[0].ToArray(),
 				ReplicationSetOutgoing: r.tracker.replicationSet[1].ToArray(),
 			}
@@ -88,92 +104,99 @@ func (r *raftx) maybeSendAppendToWitness(rn *raft.RawNode) {
 					Type:    raftpb.MsgApp,
 					To:      id,
 					From:    r.id,
-					Term:    r.term,
+					Term:    term,
+					Index:   commitIndex,
 					Context: ctx,
 				}
-				r.witnessMsgs = append(r.witnessMsgs, m)
+				r.msgs = append(r.msgs, m)
 			}
 		}
 	}
 }
 
-func (r *raftx) patchAndTransferMessages(msgs []raftpb.Message, rn *raft.RawNode) []raftpb.Message {
-	hold := make([]raftpb.Message, 0, len(msgs)+len(r.witnessMsgs))
-	output := make([]raftpb.Message, 0, len(msgs)+len(r.witnessMsgs))
-	votes := rn.GetVotes()
-	witnesses := map[uint64]struct{}{}
-
-	for _, m := range msgs {
-		switch m.Type {
-		case raftpb.MsgPreVote, raftpb.MsgVote:
-			// hold (pre)vote requests sent by raft to witness if we have not got enough grants.
-			// raftx will resend them after enough (subquorum) votes are granted.
-			if r.tracker.isWitness(m.To) {
-				witnesses[m.To] = struct{}{}
-				switch r.tracker.voteResultWithExtraVote(votes, m.To) {
-				case quorum.VoteWon:
-					// send out raftx pending witness vote if we've got enough grants
-					witnessContext := raftxpb.WitnessContext{
-						Context: nil,
-						Subterm: r.subterm,
-						Votes:   votes,
-					}
-					if ctx, err := witnessContext.Marshal(); err == nil {
-						m := raftpb.Message{
-							Type:    raftpb.MsgApp,
-							To:      id,
-							From:    r.id,
-							Term:    r.term,
-							Context: ctx,
-						}
-						r.witnessMsgs = append(r.witnessMsgs, m)
-					}
-					output = append(output, m)
-				case quorum.VoteLost:
-					// or throw it if the candidate already losts election
-					continue
-				case quorum.VotePending:
-					// hold it back for next round of check if we did not get enought grants
-					hold = append(hold, m)
-				}
-			}
-		case raftpb.MsgApp:
-			// ignore append messages sent by raft to witness
-			// raftx will send special append messages to witness when needed.
-			if r.tracker.isWitness(m.To) {
-				continue
-			}
+func (r *raftx) patchVoteMessageToWitness(m *raftpb.Message, votes map[uint64]bool) {
+	voteArray := make([]uint64, 0, len(votes))
+	for v, g := range votes {
+		if g {
+			voteArray = append(voteArray, v)
 		}
-		output = append(output)
+	}
+	subterm := r.slicer.GetSubterm(m.Index)
+	witnessContext := raftxpb.WitnessContext{
+		Context:    m.Context,
+		LogTerm:    subterm.Term,
+		LogSubterm: subterm.Subterm,
+		Votes:      voteArray,
+	}
+	ctx, err := witnessContext.Marshal()
+	if err != nil {
+		r.logger.Panic("failed to marshal witness context")
+	}
+	m.Context = ctx
+}
+
+func (r *raftx) maybeSendPendingVotes(rn *raft.RawNode) {
+	st := rn.BasicStatus()
+	var voteTerm uint64
+	switch st.RaftState {
+	case raft.StatePreCandidate:
+		voteTerm = st.Term + 1
+	case raft.StateCandidate:
+		voteTerm = st.Term
+	default:
+		r.pendingVotes = outboundMessagesInSameTerm{}
+		return
+	}
+	if r.pendingVotes.term() != voteTerm {
+		r.pendingVotes = outboundMessagesInSameTerm{}
+		return
 	}
 
-	for _, m := range r.witnessMsgs {
-		if !r.tracker.isWitness(m.To) {
-			// throw messages that are no longer sent to a witness
+	votes := rn.GetVotes()
+	okInIncoming := r.tracker.hasSubQuorumVotes(votes, true)
+	okInOutgoing := r.tracker.hasSubQuorumVotes(votes, false)
+	for id, m := range r.pendingVotes {
+		if (st.RaftState == raft.StatePreCandidate && m.Type != raftpb.MsgPreVote) ||
+			(st.RaftState == raft.StateCandidate && m.Type != raftpb.MsgVote) {
+			delete(r.pendingVotes, id)
 			continue
 		}
-		switch m.Type {
-		case raftpb.MsgPreVote, raftpb.MsgVote:
-			if _, exist := witnesses[m.To]; exist {
-				// we only hold or send the latest vote messages to each witness.
+		if (okInIncoming && r.tracker.isVoter(id, true)) ||
+			(okInOutgoing && r.tracker.isVoter(id, false)) {
+			r.patchVoteMessageToWitness(&m, votes)
+			r.msgs = append(r.msgs, m)
+			delete(r.pendingVotes, id)
+		}
+	}
+}
+
+func (r *raftx) patchReadyMessages(msgs []raftpb.Message, rn *raft.RawNode) []raftpb.Message {
+	output := make([]raftpb.Message, 0, len(msgs)+len(r.msgs)+len(r.pendingVotes))
+
+	// filter ready messages
+	for _, m := range msgs {
+		if r.tracker.isWitness(m.To) {
+			switch m.Type {
+			case raftpb.MsgPreVote, raftpb.MsgVote:
+				// hold (pre)vote requests sent by raft to witness .
+				// raftx will resend them after enough (subquorum) votes are granted.
+				r.pendingVotes = r.pendingVotes.addAndPurgeOld(m)
 				continue
-			}
-			switch r.tracker.voteResultWithExtraVote(votes, m.To) {
-			case quorum.VoteWon:
-				// send out raftx pending witness vote if we've got enough grants
-				output = append(output, m)
-			case quorum.VoteLost:
-				// or throw it if the candidate already losts election
+			case raftpb.MsgApp:
+				// ignore append messages sent by raft to witness
+				// raftx will send special append messages to witness when needed.
 				continue
-			case quorum.VotePending:
-				// hold it back for next round of check if we did not get enought grants
-				hold = append(hold, m)
 			}
 		}
 		output = append(output)
 	}
 
-	r.witnessMsgs = hold
+	// send pending votes when we've got subquorum grants
+	r.maybeSendPendingVotes(rn)
+
+	// send out raftx messages
+	output = append(output, r.msgs...)
+
 	return output
 }
 

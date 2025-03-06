@@ -8,6 +8,14 @@ import (
 
 type ReplicationSet map[uint64]struct{}
 
+func NewReplicationSet(ids []uint64) ReplicationSet {
+	rs := make(ReplicationSet, len(ids))
+	for _, id := range ids {
+		rs[id] = struct{}{}
+	}
+	return rs
+}
+
 func (r ReplicationSet) Equals(rs ReplicationSet) bool {
 	if len(r) != len(rs) {
 		return false

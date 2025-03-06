@@ -4,53 +4,41 @@ import (
 	"sort"
 )
 
-type SubtermLocation struct {
+type SubtermInfo struct {
+	Term    uint64
 	Subterm uint64
 	Index   uint64
 }
 type SubtermSlicer struct {
-	subterms map[uint64][]SubtermLocation
+	subterms []SubtermInfo
 }
 
 func NewSubtermSlicer() *SubtermSlicer {
 	return &SubtermSlicer{
-		subterms: map[uint64][]SubtermLocation{},
+		subterms: []SubtermInfo{},
 	}
 }
 
-func (s *SubtermSlicer) AddSubterm(term uint64, subterm uint64, index uint64) {
-	slice, ok := s.subterms[term]
-	if !ok {
-		s.subterms[term] = []SubtermLocation{SubtermLocation{Subterm: subterm, Index: index}}
-		return
-	}
-
-	pos := sort.Search(len(slice), func(i int) bool {
-		return index < slice[i].Index
+func (s *SubtermSlicer) AppendSubterm(term uint64, subterm uint64, index uint64) {
+	pos := sort.Search(len(s.subterms), func(i int) bool {
+		return index <= s.subterms[i].Index
 	})
-	if pos == len(slice) {
-		s.subterms[term] = append(slice, SubtermLocation{Subterm: subterm, Index: index})
+	if pos == len(s.subterms) {
+		s.subterms = append(s.subterms, SubtermInfo{Term: term, Subterm: subterm, Index: index})
 		return
 	}
 
-	slice = append(slice, SubtermLocation{})
-	copy(slice[pos+1:], slice[pos:])
-	slice[pos] = SubtermLocation{Subterm: subterm, Index: index}
-	s.subterms[term] = slice
+	s.subterms = append(s.subterms[:pos], SubtermInfo{Term: term, Subterm: subterm, Index: index})
 }
 
-func (s *SubtermSlicer) GetSubterm(term uint64, index uint64) uint64 {
-	slice, ok := s.subterms[term]
-	if !ok {
-		return 0
-	}
-	pos := sort.Search(len(slice), func(i int) bool {
-		return index < slice[i].Index
+func (s *SubtermSlicer) GetSubterm(index uint64) SubtermInfo {
+	pos := sort.Search(len(s.subterms), func(i int) bool {
+		return index < s.subterms[i].Index
 	})
 
 	if pos == 0 {
-		return 0
+		panic("index out of range")
 	}
 
-	return slice[pos-1].Subterm
+	return s.subterms[pos-1]
 }

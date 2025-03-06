@@ -68,8 +68,6 @@ func (n *node) Step(ctx context.Context, msg raftpb.Message) error {
 		n.DoCustomCommand(context.Background(), NewActivateWitnessCommand(n.rx, msg.From))
 		return nil
 	}
-
-	n.DoCustomCommand(context.Background(), NewBeforeRaftStepCommand(n.rx, &msg))
 	defer func() {
 		go func() {
 			n.DoCustomCommand(context.Background(), NewAfterRaftStepCommand(n.rx, &msg))
